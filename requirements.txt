@@ -1,2 +1,2 @@
-python-telegram-bot==21.6
+telethon>=1.37
 yt-dlp[default]

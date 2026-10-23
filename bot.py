@@ -1,25 +1,22 @@
 import asyncio
+import html
 import logging
 import os
 import re
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telethon import Button, TelegramClient, events
+from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
 logging.basicConfig(level=logging.INFO)
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
 TOKEN = os.environ["BOT_TOKEN"]
-MAX_MB = 50  # límite de la Bot API de Telegram para subir archivos
+MAX_MB = 2000  # límite de Telegram por MTProto (2 GB)
 VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})")
 
 # Opcional: cookies de YouTube (contenido de cookies.txt en la variable COOKIES)
@@ -29,20 +26,41 @@ if os.environ.get("COOKIES"):
     with open(COOKIES_FILE, "w") as f:
         f.write(os.environ["COOKIES"])
 
+client = TelegramClient("bot_session", API_ID, API_HASH)
+client.parse_mode = "html"  # <b>negrita</b> y <i>cursiva</i>
+
+
+def bar(pct: int) -> str:
+    filled = max(0, min(10, pct // 10))
+    return "▰" * filled + "▱" * (10 - filled)
+
+
+async def animate(msg, build, stop: asyncio.Event):
+    """Edita el mensaje cada 3 s con emojis que cambian, hasta que stop se activa."""
+    i = 0
+    while not stop.is_set():
+        try:
+            await msg.edit(build(i))
+        except Exception:
+            pass
+        i += 1
+        try:
+            await asyncio.wait_for(stop.wait(), 3)
+        except asyncio.TimeoutError:
+            pass
+
 
 def base_opts():
     opts = {"noplaylist": True, "quiet": True}
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
-    # Opcional: variable YT_CLIENTS, ej. "tv,web_safari" para probar otros clientes
-    clients = os.environ.get("YT_CLIENTS")
+    clients = os.environ.get("YT_CLIENTS")  # ej. "tv,web_safari"
     if clients:
         opts["extractor_args"] = {"youtube": {"player_client": clients.split(",")}}
     return opts
 
 
 def get_heights(url):
-    """Devuelve las resoluciones que realmente ofrece YouTube para este video."""
     with yt_dlp.YoutubeDL(base_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
     heights = {
@@ -53,10 +71,20 @@ def get_heights(url):
     return sorted(h for h in heights if h <= 1080)
 
 
-def download(url, outdir, audio_only, height):
+def download(url, outdir, audio_only, height, prog):
+    def hook(d):
+        if d["status"] == "downloading":
+            prog["phase"] = "down"
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total:
+                prog["pct"] = int(d["downloaded_bytes"] * 100 / total)
+        elif d["status"] == "finished":
+            prog["phase"] = "proc"
+
     opts = base_opts()
     opts["outtmpl"] = f"{outdir}/%(title).80s.%(ext)s"
     opts["max_filesize"] = MAX_MB * 1024 * 1024
+    opts["progress_hooks"] = [hook]
     if audio_only:
         opts["format"] = "bestaudio/best"
     else:
@@ -71,85 +99,139 @@ def download(url, outdir, audio_only, height):
         return None, info
 
 
-async def process(message, status, url, audio, height):
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            path, info = await asyncio.to_thread(download, url, tmp, audio, height)
-            if not path or os.path.getsize(path) > MAX_MB * 1024 * 1024:
-                await status.edit_text(
-                    "El archivo supera los 50 MB de Telegram. Prueba con una calidad menor."
-                )
-                return
-            with open(path, "rb") as f:
-                if audio:
-                    await message.reply_audio(f, duration=info.get("duration"))
-                else:
-                    await message.reply_video(
-                        f,
-                        caption=f"{info.get('height')}p",
-                        supports_streaming=True,
-                        duration=info.get("duration"),
-                        width=info.get("width"),
-                        height=info.get("height"),
-                    )
-            await status.delete()
-        except Exception as e:
-            logging.exception("Error descargando")
-            await status.edit_text(f"No pude descargarlo: {str(e)[:200]}")
-
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Envíame un enlace de YouTube y elige la calidad (máx. 50 MB).\n"
-        "Usa /audio <enlace> para recibir solo el audio."
+@client.on(events.NewMessage(pattern=r"^/start"))
+async def start(event):
+    await event.respond(
+        "👋 <b>¡Hola!</b>\n\n"
+        "Envíame un <b>enlace de YouTube</b> y elige la calidad "
+        "<i>(hasta 2 GB)</i> 🎬\n"
+        "Usa <b>/audio</b> <i>&lt;enlace&gt;</i> para recibir solo el audio 🎵"
     )
 
 
-async def link_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    m = VIDEO_ID.search(text)
-    if "youtu" not in text or not m:
-        await update.message.reply_text("Envíame un enlace válido de YouTube.")
+@client.on(events.NewMessage(incoming=True, func=lambda e: e.raw_text and not e.raw_text.startswith("/")))
+async def on_link(event):
+    m = VIDEO_ID.search(event.raw_text)
+    if "youtu" not in event.raw_text or not m:
+        await event.respond("⚠️ <b>Envíame un enlace válido de YouTube.</b>")
         return
     vid = m.group(1)
-    status = await update.message.reply_text("Buscando calidades disponibles… 🔎")
+    status = await event.respond("🔍 <b>Buscando calidades</b> <i>.</i>")
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        animate(
+            status,
+            lambda i: f"{['🔍', '🔎'][i % 2]} <b>Buscando calidades</b> <i>{'.' * (i % 3 + 1)}</i>",
+            stop,
+        )
+    )
     try:
         heights = await asyncio.to_thread(
             get_heights, f"https://www.youtube.com/watch?v={vid}"
         )
     except Exception as e:
         logging.exception("Error leyendo formatos")
-        await status.edit_text(f"No pude leer el video: {str(e)[:200]}")
+        stop.set()
+        await task
+        await status.edit(f"❌ <b>No pude leer el video</b>\n<i>{html.escape(str(e)[:200])}</i>")
         return
-    buttons = [
-        InlineKeyboardButton(f"{h}p", callback_data=f"{h}|{vid}") for h in heights
-    ]
+    stop.set()
+    await task
+    buttons = [Button.inline(f"🎬 {h}p", f"{h}|{vid}".encode()) for h in heights]
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-    rows.append([InlineKeyboardButton("🎵 Solo audio", callback_data=f"a|{vid}")])
-    label = "Elige la calidad:"
+    rows.append([Button.inline("🎵 Solo audio", f"a|{vid}".encode())])
+    label = "✨ <b>Elige la calidad:</b>"
     if len(heights) <= 1:
-        label = "YouTube solo ofrece esta calidad desde el servidor para este video:"
-    await status.edit_text(label, reply_markup=InlineKeyboardMarkup(rows))
+        label = "ℹ️ <b>YouTube solo ofrece esta calidad desde el servidor para este video:</b>"
+    await status.edit(label, buttons=rows)
 
 
-async def choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    quality, vid = q.data.split("|")
+async def process(chat_id, status, url, audio, height):
+    prog = {"pct": 0, "phase": "down"}
+    frames = ["⏬", "📥", "⬇️"]
+
+    def build(i):
+        if prog["phase"] == "proc":
+            return f"⚙️ <b>Procesando</b> <i>{'.' * (i % 3 + 1)}</i>"
+        return f"{frames[i % 3]} <b>Descargando</b> <i>{prog['pct']}%</i>\n{bar(prog['pct'])}"
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(animate(status, build, stop))
+    last = {"t": 0.0}
+
+    async def progress(sent, total):
+        if time.time() - last["t"] > 3:
+            last["t"] = time.time()
+            pct = sent * 100 // total
+            try:
+                await status.edit(f"📤 <b>Subiendo</b> <i>{pct}%</i>\n{bar(pct)}")
+            except Exception:
+                pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            path, info = await asyncio.to_thread(download, url, tmp, audio, height, prog)
+            stop.set()
+            await task
+            if not path or os.path.getsize(path) > MAX_MB * 1024 * 1024:
+                await status.edit(
+                    "⚠️ <b>El archivo supera los 2 GB.</b>\n<i>Prueba con una calidad menor.</i>"
+                )
+                return
+            await status.edit("📤 <b>Subiendo</b> <i>0%</i>\n" + bar(0))
+            duration = int(info.get("duration") or 0)
+            title = html.escape(info.get("title") or "")
+            if audio:
+                attrs = [DocumentAttributeAudio(duration=duration, title=info.get("title"))]
+                caption = f"🎵 <b>{title}</b>"
+            else:
+                attrs = [
+                    DocumentAttributeVideo(
+                        duration=duration,
+                        w=info.get("width") or 0,
+                        h=info.get("height") or 0,
+                        supports_streaming=True,
+                    )
+                ]
+                caption = f"🎬 <b>{title}</b>\n<i>{info.get('height')}p</i>"
+            await client.send_file(
+                chat_id,
+                path,
+                caption=caption,
+                attributes=attrs,
+                supports_streaming=not audio,
+                progress_callback=progress,
+            )
+            await status.delete()
+        except Exception as e:
+            logging.exception("Error descargando")
+            stop.set()
+            await task
+            await status.edit(
+                f"❌ <b>No pude descargarlo</b>\n<i>{html.escape(str(e)[:200])}</i>"
+            )
+
+
+@client.on(events.CallbackQuery())
+async def on_button(event):
+    quality, vid = event.data.decode().split("|")
+    await event.answer()
     url = f"https://www.youtube.com/watch?v={vid}"
     audio = quality == "a"
     height = None if audio else int(quality)
-    await q.edit_message_text("Descargando… ⏳")
-    await process(q.message, q.message, url, audio, height)
+    status = await event.edit("⏬ <b>Descargando</b> <i>0%</i>\n" + bar(0))
+    await process(event.chat_id, status, url, audio, height)
 
 
-async def audio_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = ctx.args[0] if ctx.args else ""
+@client.on(events.NewMessage(pattern=r"^/audio"))
+async def audio_cmd(event):
+    parts = event.raw_text.split()
+    url = parts[1] if len(parts) > 1 else ""
     if "youtu" not in url:
-        await update.message.reply_text("Uso: /audio <enlace de YouTube>")
+        await event.respond("⚠️ <b>Uso:</b> /audio <i>&lt;enlace de YouTube&gt;</i>")
         return
-    status = await update.message.reply_text("Descargando… ⏳")
-    await process(update.message, status, url, True, None)
+    status = await event.respond("⏬ <b>Descargando</b> <i>0%</i>\n" + bar(0))
+    await process(event.chat_id, status, url, True, None)
 
 
 class Health(BaseHTTPRequestHandler):
@@ -168,9 +250,6 @@ def run_health():
 
 if __name__ == "__main__":
     threading.Thread(target=run_health, daemon=True).start()
-    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("audio", audio_cmd))
-    app.add_handler(CallbackQueryHandler(choose))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_msg))
-    app.run_polling(drop_pending_updates=True)
+    client.start(bot_token=TOKEN)
+    logging.info("Bot iniciado")
+    client.run_until_disconnected()
