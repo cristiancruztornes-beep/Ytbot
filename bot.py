@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 TOKEN = os.environ["BOT_TOKEN"]
-MAX_MB = 50  # límite de la Bot API de Telegram para subir archivos
+MAX_MB = 2048  # límite de la Bot API de Telegram para subir archivos
 
 # Opcional: cookies de YouTube (contenido de cookies.txt en la variable COOKIES)
 COOKIES_FILE = None
